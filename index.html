@@ -1,0 +1,326 @@
+
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+  #wrap{background:#080b12;border-radius:12px;padding:28px 24px 18px 24px;position:relative;font-family:'Outfit',sans-serif;}
+  #wrap *{box-sizing:border-box;}
+  .tt{position:absolute;background:rgba(10,14,24,0.95);border:1px solid #2a2f3e;border-radius:8px;padding:12px 16px;pointer-events:none;display:none;z-index:10;min-width:155px;}
+  .tt-month{font-size:14px;font-weight:600;color:#fff;margin-bottom:8px;}
+  .tt-row{display:flex;justify-content:space-between;gap:20px;font-size:12px;color:#8a90a0;margin-bottom:3px;}
+  .tt-row span:last-child{font-weight:500;}
+  .tt-season{font-size:10px;font-weight:700;letter-spacing:.1em;margin-top:8px;}
+</style>
+
+<div id="wrap">
+  <div style="position:relative;">
+    <canvas id="c" style="width:100%;display:block;"></canvas>
+    <div class="tt" id="tt">
+      <div class="tt-month" id="tt-month"></div>
+      <div class="tt-row"><span>AQI</span><span id="tt-aqi" style="color:#FF7E00;"></span></div>
+      <div class="tt-row"><span>Humidity</span><span id="tt-hum" style="color:#54C5E8;"></span></div>
+      <div class="tt-season" id="tt-season"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+// Each month index 0=Jan..11=Dec
+// We treat each month as its midpoint fractional position
+// Seasons as fractional index (0=Jan mid, 1=Feb mid, ... 11=Dec mid)
+// Winter: mid-Oct(9.5) to mid-Feb(1.5)
+// Summer: mid-Feb(1.5) to Jun(5.0)
+// Monsoon: Jun(5.0) to mid-Oct(9.5)
+
+const DATA=[
+  {m:'Jan', aqi:268, hum:85.66},
+  {m:'Feb', aqi:129, hum:67.71},
+  {m:'Mar', aqi:359, hum:51.54},
+  {m:'Apr', aqi:378, hum:30.67},
+  {m:'May', aqi:362, hum:50.41},
+  {m:'Jun', aqi:277, hum:60.07},
+  {m:'Jul', aqi:97,  hum:81.74},
+  {m:'Aug', aqi:112, hum:89.29},
+  {m:'Sep', aqi:101, hum:66.34},
+  {m:'Oct', aqi:153, hum:63.75},
+  {m:'Nov', aqi:221, hum:61.22},
+  {m:'Dec', aqi:255, hum:73.43},
+];
+
+// Season per month (for tooltip label/color)
+// Winter: Nov(10),Dec(11),Jan(0),mid-Feb → green
+// Summer: mid-Feb(1),Mar(2),Apr(3),May(4),Jun(5) → yellow
+// Monsoon: Jun(5),Jul(6),Aug(7),Sep(8),Oct(9),mid-Oct → blue
+const MONTH_SEASON=[
+  {name:'Winter',      label:'#4caf82'},  // 0 Jan
+  {name:'Winter',      label:'#4caf82'},  // 1 Feb (mostly winter)
+  {name:'Summer',      label:'#c4a84a'},  // 2 Mar
+  {name:'Summer',      label:'#c4a84a'},  // 3 Apr
+  {name:'Summer',      label:'#c4a84a'},  // 4 May
+  {name:'Summer',      label:'#c4a84a'},  // 5 Jun (start of monsoon at end)
+  {name:'Monsoon',     label:'#54C5E8'},  // 6 Jul
+  {name:'Monsoon',     label:'#54C5E8'},  // 7 Aug
+  {name:'Monsoon',     label:'#54C5E8'},  // 8 Sep
+  {name:'Monsoon',     label:'#54C5E8'},  // 9 Oct (mostly monsoon)
+  {name:'Winter',      label:'#4caf82'},  // 10 Nov
+  {name:'Winter',      label:'#4caf82'},  // 11 Dec
+];
+
+// Season bands as fractional x positions (0=Jan, 11=Dec, each unit = 1 month)
+// We'll draw bands between these fractional boundaries
+// Winter: 0 → 1.5 and 9.5 → 11
+// Summer: 1.5 → 6.0
+// Monsoon: 6.0 → 9.5
+const SEASON_BANDS=[
+  {from:0,   to:1.5,  col:'rgba(22,70,44,0.45)', name:'Winter', ncol:'#4caf82'},
+  {from:1.5, to:6.0,  col:'rgba(95,78,8,0.45)',  name:'Summer', ncol:'#c4a84a'},
+  {from:6.0, to:9.5,  col:'rgba(8,55,85,0.45)',  name:'Monsoon',ncol:'#54C5E8'},
+  {from:9.5, to:11,   col:'rgba(22,70,44,0.45)', name:'Winter', ncol:'#4caf82'},
+];
+
+const AQI_COL='#FF7E00', HUM_COL='#54C5E8';
+// Generous padding for rotated axis labels
+const PAD={top:44,right:80,bottom:48,left:80};
+const canvas=document.getElementById('c');
+const wrap=document.getElementById('wrap');
+const tt=document.getElementById('tt');
+let hoverFi=-1;
+
+function lerp(a,b,t){return a+(b-a)*t;}
+function W(){return canvas.width/devicePixelRatio;}
+function H(){return canvas.height/devicePixelRatio;}
+function bt(){return H()-PAD.bottom;}
+function cW(){return W()-PAD.left-PAD.right;}
+function cH(){return H()-PAD.top-PAD.bottom;}
+
+// Map fractional month index (0=Jan, 11=Dec) to canvas x
+function xFor(fi){return PAD.left+(fi/11)*cW();}
+function yAqi(v){return PAD.top+(1-(v/420))*cH();}
+function yHum(v){return PAD.top+(1-(v/100))*cH();}
+
+// Catmull-Rom spline — uses index-based points
+function catmull(ctx,pts,tension=0.4){
+  if(pts.length<2)return;
+  ctx.moveTo(pts[0][0],pts[0][1]);
+  for(let i=0;i<pts.length-1;i++){
+    const p0=pts[Math.max(i-1,0)],p1=pts[i],p2=pts[i+1],p3=pts[Math.min(i+2,pts.length-1)];
+    ctx.bezierCurveTo(
+      p1[0]+(p2[0]-p0[0])*tension/2, p1[1]+(p2[1]-p0[1])*tension/2,
+      p2[0]-(p3[0]-p1[0])*tension/2, p2[1]-(p3[1]-p1[1])*tension/2,
+      p2[0],p2[1]
+    );
+  }
+}
+
+// Evaluate catmull-rom Y at fractional index fi for a set of pts
+// pts are at integer positions 0..N-1
+function catmullY(pts,fi){
+  const n=pts.length;
+  const i=Math.max(0,Math.min(n-2,Math.floor(fi)));
+  const t=fi-i;
+  const p0=pts[Math.max(i-1,0)];
+  const p1=pts[i];
+  const p2=pts[Math.min(i+1,n-1)];
+  const p3=pts[Math.min(i+2,n-1)];
+  const tension=0.4;
+  // cubic bezier: compute Y only
+  const cp1y=p1[1]+(p2[1]-p0[1])*tension/2;
+  const cp2y=p2[1]-(p3[1]-p1[1])*tension/2;
+  // bezier formula
+  const mt=1-t;
+  return mt*mt*mt*p1[1]+3*mt*mt*t*cp1y+3*mt*t*t*cp2y+t*t*t*p2[1];
+}
+
+function getSeasonAtFi(fi){
+  for(const b of SEASON_BANDS){
+    if(fi>=b.from&&fi<=b.to) return b;
+  }
+  return SEASON_BANDS[0];
+}
+
+function resize(){
+  const cw=wrap.clientWidth-48;
+  canvas.width=cw*devicePixelRatio;
+  canvas.height=340*devicePixelRatio;
+  canvas.style.width=cw+'px';
+  canvas.style.height='340px';
+  draw();
+}
+
+function draw(){
+  const dpr=devicePixelRatio;
+  const ctx=canvas.getContext('2d');
+  const w=W(),h=H(),b=bt();
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,w,h);
+  ctx.fillStyle='#080b12';
+  ctx.fillRect(0,0,w,h);
+
+  // Data points mapped to canvas coords
+  const aqiPts=DATA.map((_,i)=>[xFor(i),yAqi(DATA[i].aqi)]);
+  const humPts=DATA.map((_,i)=>[xFor(i),yHum(DATA[i].hum)]);
+
+  // Season bands
+  SEASON_BANDS.forEach(sg=>{
+    const x0=xFor(sg.from),x1=xFor(sg.to);
+    ctx.fillStyle=sg.col;
+    ctx.fillRect(x0,PAD.top,x1-x0,b-PAD.top);
+  });
+
+  // Season labels near top of each band
+  SEASON_BANDS.forEach(sg=>{
+    const cx=xFor((sg.from+sg.to)/2);
+    ctx.fillStyle=sg.ncol;ctx.font='500 11px Outfit,sans-serif';ctx.textAlign='center';
+    ctx.fillText(sg.name,cx,PAD.top+16);
+  });
+
+  // Axis lines
+  ctx.strokeStyle='rgba(255,255,255,0.22)';ctx.lineWidth=1;ctx.setLineDash([]);
+  ctx.beginPath();ctx.moveTo(PAD.left,PAD.top);ctx.lineTo(PAD.left,b);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(w-PAD.right,PAD.top);ctx.lineTo(w-PAD.right,b);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(PAD.left,b);ctx.lineTo(w-PAD.right,b);ctx.stroke();
+
+  // Rotated AQI label — left axis, same style as humidity
+  ctx.save();
+  ctx.translate(16,PAD.top+cH()/2);
+  ctx.rotate(-Math.PI/2);
+  ctx.fillStyle=AQI_COL;ctx.font='500 11px Outfit,sans-serif';ctx.textAlign='center';
+  ctx.fillText('AQI',0,0);
+  ctx.restore();
+
+  // Rotated Humidity label — right axis, mirrored
+  ctx.save();
+  ctx.translate(w-16,PAD.top+cH()/2);
+  ctx.rotate(Math.PI/2);
+  ctx.fillStyle=HUM_COL;ctx.font='500 11px Outfit,sans-serif';ctx.textAlign='center';
+  ctx.fillText('Humidity (%)',0,0);
+  ctx.restore();
+
+  // Gridlines + axis tick labels
+  ctx.font='400 11px Outfit,sans-serif';
+  [0,100,200,300,400].forEach(v=>{
+    const y=yAqi(v);
+    ctx.strokeStyle='rgba(255,255,255,0.06)';ctx.lineWidth=1;ctx.setLineDash([3,4]);
+    ctx.beginPath();ctx.moveTo(PAD.left,y);ctx.lineTo(w-PAD.right,y);ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle='#ffffff';ctx.textAlign='right';
+    ctx.fillText(v,PAD.left-8,y+4);
+    const hv=v/4;
+    ctx.fillStyle='#ffffff';ctx.textAlign='left';
+    ctx.fillText(hv+'%',w-PAD.right+8,yHum(hv)+4);
+  });
+
+  // Vertical dashed separators at each month
+  for(let i=1;i<DATA.length;i++){
+    const x=xFor(i);
+    ctx.strokeStyle='rgba(255,255,255,0.06)';ctx.setLineDash([3,5]);ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(x,PAD.top);ctx.lineTo(x,b);ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  // Full lines — always full brightness
+  ctx.beginPath();catmull(ctx,aqiPts);
+  ctx.strokeStyle=AQI_COL;ctx.lineWidth=2.5;ctx.stroke();
+
+  ctx.beginPath();catmull(ctx,humPts);
+  ctx.strokeStyle=HUM_COL;ctx.lineWidth=2.5;ctx.stroke();
+
+  // Static dots (small)
+  DATA.forEach((_,i)=>{
+    ctx.beginPath();ctx.arc(aqiPts[i][0],aqiPts[i][1],1.8,0,Math.PI*2);
+    ctx.fillStyle='#fff';ctx.fill();
+    ctx.beginPath();ctx.arc(humPts[i][0],humPts[i][1],1.8,0,Math.PI*2);
+    ctx.fillStyle=HUM_COL;ctx.fill();
+  });
+
+  // Hover
+  if(hoverFi>=0){
+    const fi=hoverFi;
+    const hx=xFor(fi);
+    // Use catmullY to get precise Y on the spline at fi
+    const hay=catmullY(aqiPts,fi);
+    const hhy=catmullY(humPts,fi);
+
+    // Vertical crosshair
+    ctx.strokeStyle='rgba(255,255,255,0.15)';ctx.lineWidth=1;ctx.setLineDash([3,4]);
+    ctx.beginPath();ctx.moveTo(hx,PAD.top);ctx.lineTo(hx,b);ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Dotted horizontal: AQI dot → left axis
+    ctx.strokeStyle=AQI_COL+'88';ctx.lineWidth=1;ctx.setLineDash([3,4]);
+    ctx.beginPath();ctx.moveTo(PAD.left,hay);ctx.lineTo(hx,hay);ctx.stroke();
+
+    // Dotted horizontal: Humidity dot → right axis
+    ctx.strokeStyle=HUM_COL+'88';ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(hx,hhy);ctx.lineTo(w-PAD.right,hhy);ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Interpolated values
+    const i0=Math.floor(Math.max(0,Math.min(DATA.length-2,fi)));
+    const t=fi-i0;
+    const aqiVal=Math.round(lerp(DATA[i0].aqi,DATA[Math.min(i0+1,DATA.length-1)].aqi,t));
+    const humVal=lerp(DATA[i0].hum,DATA[Math.min(i0+1,DATA.length-1)].hum,t);
+
+    // Axis value readouts
+    ctx.font='600 10px Outfit,sans-serif';
+    ctx.fillStyle=AQI_COL;ctx.textAlign='right';
+    ctx.fillText(aqiVal,PAD.left-4,hay+4);
+    ctx.fillStyle=HUM_COL;ctx.textAlign='left';
+    ctx.fillText(humVal.toFixed(1)+'%',w-PAD.right+4,hhy+4);
+
+    // Hover dots (slightly larger)
+    ctx.beginPath();ctx.arc(hx,hay,3.5,0,Math.PI*2);
+    ctx.fillStyle='#fff';ctx.fill();
+    ctx.beginPath();ctx.arc(hx,hhy,3.5,0,Math.PI*2);
+    ctx.fillStyle=HUM_COL;ctx.fill();
+  }
+
+  // X-axis month labels
+  DATA.forEach((d,i)=>{
+    const x=xFor(i);
+    const s=MONTH_SEASON[i];
+    const isHov=hoverFi>=0&&Math.abs(i-hoverFi)<0.6;
+    ctx.fillStyle=isHov?s.label:'#ffffff';
+    ctx.font=`${isHov?'600':'400'} 12px Outfit,sans-serif`;
+    ctx.textAlign='center';
+    ctx.fillText(d.m,x,b+22);
+  });
+}
+
+canvas.addEventListener('mousemove',e=>{
+  const rect=canvas.getBoundingClientRect();
+  const mx=e.clientX-rect.left;
+  const w=parseFloat(canvas.style.width);
+  if(mx<PAD.left||mx>w-PAD.right){
+    hoverFi=-1;tt.style.display='none';draw();return;
+  }
+  hoverFi=Math.max(0,Math.min(11,(mx-PAD.left)/cW()*11));
+
+  const i0=Math.floor(Math.max(0,Math.min(DATA.length-2,hoverFi)));
+  const t=hoverFi-i0;
+  const aqiVal=Math.round(lerp(DATA[i0].aqi,DATA[Math.min(i0+1,DATA.length-1)].aqi,t));
+  const humVal=lerp(DATA[i0].hum,DATA[Math.min(i0+1,DATA.length-1)].hum,t);
+  const sg=getSeasonAtFi(hoverFi);
+
+  const i0f=Math.floor(hoverFi),i1f=Math.min(i0f+1,DATA.length-1);
+  const tf=hoverFi-i0f;
+  const lbl=tf>0.08&&tf<0.92?`${DATA[i0f].m} – ${DATA[i1f].m} 2025`:(tf<0.5?DATA[i0f].m:DATA[i1f].m)+' 2025';
+
+  document.getElementById('tt-month').textContent=lbl;
+  document.getElementById('tt-aqi').textContent=aqiVal;
+  document.getElementById('tt-hum').textContent=humVal.toFixed(1)+'%';
+  const ts=document.getElementById('tt-season');
+  ts.textContent=sg.name.toUpperCase();ts.style.color=sg.ncol;
+
+  const canH=parseFloat(canvas.style.height);
+  const hx=xFor(hoverFi);
+  let lx=hx+14;
+  if(lx+165>w)lx=hx-178;
+  tt.style.left=lx+'px';
+  tt.style.top=Math.max(4,canH*0.12)+'px';
+  tt.style.display='block';
+  draw();
+});
+
+canvas.addEventListener('mouseleave',()=>{hoverFi=-1;tt.style.display='none';draw();});
+window.addEventListener('resize',resize);
+resize();
+</script>
